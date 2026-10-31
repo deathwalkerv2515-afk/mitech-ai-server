@@ -1,8 +1,8 @@
-fastapi
-uvicorn
-requests
-pillow
-numpy
-python-multipart
-setuptools<81
-face_recognition
+fastapi==0.110.0
+uvicorn==0.28.0
+requests==2.31.0
+pillow==10.2.0
+numpy==1.26.4
+python-multipart==0.0.9
+dlib-bin==19.24.6
+face-recognition==1.3.0
