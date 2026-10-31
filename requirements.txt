@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+requests
+pillow
+numpy
+python-multipart
+setuptools<81
+face_recognition
