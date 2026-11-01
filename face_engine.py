@@ -7,7 +7,7 @@ import face_recognition
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="MiTech Anti-Spoofing Cloud AI Engine (Fast & High-Accuracy)")
+app = FastAPI(title="MiTech Anti-Spoofing & 3D Liveness AI Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,16 +17,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Persistent Memory Cache para sa mabilis na pag-match (Hindi na magda-download paulit-ulit)
 KNOWN_FACE_ENCODINGS = {}
 KNOWN_EMPLOYEES_META = {}
 
 def get_ear(eye):
-    """Kalkulahin ang Eye Aspect Ratio (EAR)."""
+    """Kalkulahin ang Eye Aspect Ratio (EAR) para sa mata."""
     A = np.linalg.norm(np.array(eye[1]) - np.array(eye[5]))
     B = np.linalg.norm(np.array(eye[2]) - np.array(eye[4]))
     C = np.linalg.norm(np.array(eye[0]) - np.array(eye[3]))
-    return (A + B) / (2.0 * C)
+    return float((A + B) / (2.0 * C))
+
+def get_mar(lm):
+    """Kalkulahin ang Mouth Aspect Ratio (MAR) para sa bibig."""
+    top = np.array(lm['top_lip'][9])
+    bot = np.array(lm['bottom_lip'][9])
+    left = np.array(lm['top_lip'][0])
+    right = np.array(lm['top_lip'][6])
+    return float(np.linalg.norm(top - bot) / (np.linalg.norm(left - right) + 1e-6))
+
+def get_relative_features(lm):
+    """Kalkulahin ang 3D Relative Ratios ng mukha."""
+    left_eye = np.mean(lm['left_eye'], axis=0)
+    right_eye = np.mean(lm['right_eye'], axis=0)
+    nose = np.mean(lm['nose_tip'], axis=0)
+    chin = np.array(lm['chin'][8])
+    mouth = np.mean(lm['top_lip'] + lm['bottom_lip'], axis=0)
+
+    eye_dist = float(np.linalg.norm(left_eye - right_eye) + 1e-6)
+
+    d_nose_left = float(np.linalg.norm(nose - left_eye) / eye_dist)
+    d_nose_right = float(np.linalg.norm(nose - right_eye) / eye_dist)
+    d_nose_chin = float(np.linalg.norm(nose - chin) / eye_dist)
+    d_mouth_chin = float(np.linalg.norm(mouth - chin) / eye_dist)
+
+    return np.array([d_nose_left, d_nose_right, d_nose_chin, d_mouth_chin])
 
 @app.get("/")
 def root():
@@ -39,22 +63,21 @@ async def verify_face(
     candidates: str = Form(...)
 ):
     try:
-        # 1. Mabilis na i-load at i-downscale ang Frame 1 (360px para 3x faster sa CPU)
+        # 1. I-load at i-scale ang Frame 1 (360px para mabilis)
         c1 = await image1.read()
         pil1 = Image.open(io.BytesIO(c1)).convert("RGB")
         pil1.thumbnail((360, 360))
         np1 = np.array(pil1)
 
-        # Hanapin ang mukha
         face_locations1 = face_recognition.face_locations(np1, model="hog")
         if not face_locations1:
-            return {"matched": False, "message": "Walang mukhang nakita sa camera. Pakiayos ang pwesto."}
+            return {"matched": False, "message": "Walang mukhang nakita sa camera. Paki-harap ang totoong mukha."}
 
         live_encodings = face_recognition.face_encodings(np1, face_locations1)
         if not live_encodings:
-            return {"matched": False, "message": "Hindi ma-proseso ang mukha. Siguraduhing maliwanag."}
+            return {"matched": False, "message": "Hindi malinaw ang mukha. Siguraduhing maliwanag."}
 
-        # ── 2. SMART ANTI-SPOOFING (Passive Micro-Movement + Dynamic Liveness) ──
+        # ── 2. BULLETPROOF 3D LIVENESS & PHONE SCREEN DETECTION ──
         if image2 is not None:
             c2 = await image2.read()
             pil2 = Image.open(io.BytesIO(c2)).convert("RGB")
@@ -66,48 +89,65 @@ async def verify_face(
             lm2 = face_recognition.face_landmarks(np2, face_locations2) if face_locations2 else None
 
             if lm1 and lm2:
-                # A. Suriin ang Eye Aspect Ratio (Blink or Eye Fluctuation)
+                # A. Pagsuri sa pagkurap o paggalaw ng mata
                 ear1 = (get_ear(lm1[0]['left_eye']) + get_ear(lm1[0]['right_eye'])) / 2.0
                 ear2 = (get_ear(lm2[0]['left_eye']) + get_ear(lm2[0]['right_eye'])) / 2.0
-                has_eye_action = (abs(ear1 - ear2) >= 0.015) or (ear1 < 0.18) or (ear2 < 0.18)
+                ear_change = abs(ear1 - ear2)
 
-                # B. Suriin ang Natural Human Micro-Movement (3D Non-Rigid Shift)
-                # Ang picture sa cellphone/papel kapag nakatapat ay 100% frozen (0.0 pixel jitter)
-                nose1 = np.array(lm1[0]['nose_tip'])
-                nose2 = np.array(lm2[0]['nose_tip'])
-                chin1 = np.array(lm1[0]['chin'])
-                chin2 = np.array(lm2[0]['chin'])
+                # B. Pagsuri sa bibig
+                mar1 = get_mar(lm1[0])
+                mar2 = get_mar(lm2[0])
+                mar_change = abs(mar1 - mar2)
 
-                motion_diff = float(np.mean(np.abs(nose1 - nose2)) + np.mean(np.abs(chin1 - chin2)))
+                # C. 3D Non-Rigid Facial Deformation (Huli ang Cellphone/Papel dito!)
+                # Sa cellphone o picture, 100% FLAT ito. Kahit iwagayway mo ang phone, 0.0 ang deformation!
+                feat1 = get_relative_features(lm1[0])
+                feat2 = get_relative_features(lm2[0])
+                internal_deformation = float(np.sum(np.abs(feat1 - feat2)))
 
-                # Kung 100% static (litrato sa stand/cellphone na walang anumang natural human movement)
-                is_completely_frozen = (motion_diff < 0.12) and not has_eye_action
+                # D. Pagsuri kung inalog ang cellphone (Rigid Translation)
+                nose1 = np.array(lm1[0]['nose_tip'][2])
+                nose2 = np.array(lm2[0]['nose_tip'][2])
+                global_shift = float(np.linalg.norm(nose1 - nose2))
 
-                # Kung masyadong malikot o inalog ang papel
-                is_excessive_shake = motion_diff > 35.0
+                # E. Specular Screen Glare (Reflection sa salamin ng cellphone)
+                gray1 = np.mean(np1, axis=2)
+                specular_glare = float(np.sum(gray1 > 248) / gray1.size)
 
-                if is_completely_frozen:
+                # ── MGA PATAKARAN SA PAG-HARANG NG PEKE ──
+                # 1. Kung static picture sa cellphone (walang kurap, walang galaw ang bibig, at 0 deformation)
+                if ear_change < 0.009 and mar_change < 0.009 and internal_deformation < 0.012:
                     return {
                         "matched": False,
-                        "message": "PEKE / STATIC PICTURE: Nakitang litrato o hindi gumagalaw. Paki-harap ang mukha nang natural."
+                        "message": "ACCESS DENIED: Cellphone Screen o Litrato ang nakita! Bawal ang litrato."
                     }
-                elif is_excessive_shake:
+
+                # 2. Kung inalog ang cellphone sa kamay para magkunwaring gumagalaw (flat rigid movement)
+                if global_shift > 1.2 and internal_deformation < 0.011 and ear_change < 0.008:
                     return {
                         "matched": False,
-                        "message": "MASYADONG MALIKOT: Manatiling nakaharap nang maayos sa camera."
+                        "message": "ACCESS DENIED: Bawal iwagayway ang litrato o cellphone sa camera!"
                     }
+
+                # 3. Kung may matinding reflection ng screen ng cellphone
+                if specular_glare > 0.14 and internal_deformation < 0.018:
+                    return {
+                        "matched": False,
+                        "message": "ACCESS DENIED: Cellphone reflection detected. Ilapit ang totoong mukha."
+                    }
+        else:
+            return {"matched": False, "message": "Liveness check requires 2 frames."}
 
         live_face = live_encodings[0]
         employee_list = json.loads(candidates)
 
-        # ── 3. MEMORY CACHE (Pre-warmed Encodings para Instant ang Tugon) ──
+        # ── 3. PRE-WARMED CACHE & EMBEDDINGS MATCHING ──
         for emp in employee_list:
             emp_id = emp["employee_id"]
             if emp_id not in KNOWN_FACE_ENCODINGS:
                 KNOWN_FACE_ENCODINGS[emp_id] = []
                 KNOWN_EMPLOYEES_META[emp_id] = emp
 
-                # Kumuha ng mga anggulo (front, left, right, up, down)
                 photos = emp.get("face_photos") or []
                 if not photos and emp.get("photo_url"):
                     photos = [{"angle": "front", "url": emp.get("photo_url")}]
@@ -127,11 +167,10 @@ async def verify_face(
                     except Exception:
                         pass
 
-        # ── 4. HIGH-ACCURACY FACE DISTANCE MATCHING ──
+        # ── 4. MATCHING ──
         best_match = None
         min_distance = 1.0
-        # 0.52 ang standard benchmark para sa dlib 128D: mataas ang accuracy kahit may bintana/backlight sa likod
-        MATCH_THRESHOLD = 0.52
+        MATCH_THRESHOLD = 0.50
 
         for emp_id, enc_list in KNOWN_FACE_ENCODINGS.items():
             if not enc_list:
