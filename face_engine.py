@@ -7,7 +7,7 @@ import face_recognition
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="MiTech Anti-Spoofing & 3D Liveness AI Engine")
+app = FastAPI(title="MiTech Anti-Spoofing & Liveness AI Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,36 +21,34 @@ KNOWN_FACE_ENCODINGS = {}
 KNOWN_EMPLOYEES_META = {}
 
 def get_ear(eye):
-    """Kalkulahin ang Eye Aspect Ratio (EAR) para sa mata."""
+    """Kalkulahin ang Eye Aspect Ratio (EAR)."""
     A = np.linalg.norm(np.array(eye[1]) - np.array(eye[5]))
     B = np.linalg.norm(np.array(eye[2]) - np.array(eye[4]))
     C = np.linalg.norm(np.array(eye[0]) - np.array(eye[3]))
     return float((A + B) / (2.0 * C))
 
-def get_mar(lm):
-    """Kalkulahin ang Mouth Aspect Ratio (MAR) para sa bibig."""
-    top = np.array(lm['top_lip'][9])
-    bot = np.array(lm['bottom_lip'][9])
-    left = np.array(lm['top_lip'][0])
-    right = np.array(lm['top_lip'][6])
-    return float(np.linalg.norm(top - bot) / (np.linalg.norm(left - right) + 1e-6))
+def crop_normalized_region(img_np, box, size=(64, 64)):
+    """I-crop at i-normalize ang mata para sa pixel correlation test."""
+    top, right, bottom, left = box
+    top = max(0, int(top))
+    left = max(0, int(left))
+    bottom = min(img_np.shape[0], int(bottom))
+    right = min(img_np.shape[1], int(right))
+    if top >= bottom or left >= right:
+        return np.zeros(size, dtype=np.float32)
+    crop = img_np[top:bottom, left:right]
+    pil_crop = Image.fromarray(crop).convert("L").resize(size)
+    arr = np.array(pil_crop, dtype=np.float32)
+    std = float(np.std(arr))
+    if std < 1e-4:
+        return arr - np.mean(arr)
+    return (arr - np.mean(arr)) / std
 
-def get_relative_features(lm):
-    """Kalkulahin ang 3D Relative Ratios ng mukha."""
-    left_eye = np.mean(lm['left_eye'], axis=0)
-    right_eye = np.mean(lm['right_eye'], axis=0)
-    nose = np.mean(lm['nose_tip'], axis=0)
-    chin = np.array(lm['chin'][8])
-    mouth = np.mean(lm['top_lip'] + lm['bottom_lip'], axis=0)
-
-    eye_dist = float(np.linalg.norm(left_eye - right_eye) + 1e-6)
-
-    d_nose_left = float(np.linalg.norm(nose - left_eye) / eye_dist)
-    d_nose_right = float(np.linalg.norm(nose - right_eye) / eye_dist)
-    d_nose_chin = float(np.linalg.norm(nose - chin) / eye_dist)
-    d_mouth_chin = float(np.linalg.norm(mouth - chin) / eye_dist)
-
-    return np.array([d_nose_left, d_nose_right, d_nose_chin, d_mouth_chin])
+def compute_correlation(arr1, arr2):
+    """Kalkulahin ang pagkakapareho ng pixels sa pagitan ng dalawang frames."""
+    if arr1.shape != arr2.shape:
+        return 0.0
+    return float(np.mean(arr1 * arr2))
 
 @app.get("/")
 def root():
@@ -63,77 +61,84 @@ async def verify_face(
     candidates: str = Form(...)
 ):
     try:
-        # 1. I-load at i-scale ang Frame 1 (360px para mabilis)
+        # 1. I-load ang Frame 1
         c1 = await image1.read()
         pil1 = Image.open(io.BytesIO(c1)).convert("RGB")
-        pil1.thumbnail((360, 360))
+        pil1.thumbnail((400, 400))
         np1 = np.array(pil1)
 
         face_locations1 = face_recognition.face_locations(np1, model="hog")
         if not face_locations1:
-            return {"matched": False, "message": "Walang mukhang nakita sa camera. Paki-harap ang totoong mukha."}
+            return {"matched": False, "message": "Walang mukhang nakita sa camera. Pakiayos ang pwesto."}
 
         live_encodings = face_recognition.face_encodings(np1, face_locations1)
         if not live_encodings:
-            return {"matched": False, "message": "Hindi malinaw ang mukha. Siguraduhing maliwanag."}
+            return {"matched": False, "message": "Hindi ma-proseso ang mukha. Siguraduhing maliwanag."}
 
-        # ── 2. BULLETPROOF 3D LIVENESS & PHONE SCREEN DETECTION ──
+        # ── 2. ANTI-SPOOFING (Bawal ang Cellphone Screen at Static Picture) ──
         if image2 is not None:
             c2 = await image2.read()
             pil2 = Image.open(io.BytesIO(c2)).convert("RGB")
-            pil2.thumbnail((360, 360))
+            pil2.thumbnail((400, 400))
             np2 = np.array(pil2)
 
-            lm1 = face_recognition.face_landmarks(np1, face_locations1)
             face_locations2 = face_recognition.face_locations(np2, model="hog")
-            lm2 = face_recognition.face_landmarks(np2, face_locations2) if face_locations2 else None
+            if not face_locations2:
+                return {"matched": False, "message": "Nawala ang mukha sa pangalawang frame. Manatiling nakaharap."}
+
+            lm1 = face_recognition.face_landmarks(np1, face_locations1)
+            lm2 = face_recognition.face_landmarks(np2, face_locations2)
 
             if lm1 and lm2:
-                # A. Pagsuri sa pagkurap o paggalaw ng mata
+                # A. Pagsuri sa Pagkurap (Blink Analysis)
                 ear1 = (get_ear(lm1[0]['left_eye']) + get_ear(lm1[0]['right_eye'])) / 2.0
                 ear2 = (get_ear(lm2[0]['left_eye']) + get_ear(lm2[0]['right_eye'])) / 2.0
                 ear_change = abs(ear1 - ear2)
 
-                # B. Pagsuri sa bibig
-                mar1 = get_mar(lm1[0])
-                mar2 = get_mar(lm2[0])
-                mar_change = abs(mar1 - mar2)
+                # Ang totoong kurap ay nagbabago ng EAR (> 0.022) o pumipikit (< 0.185)
+                has_blinked = (ear_change >= 0.022) or (ear1 < 0.185 or ear2 < 0.185)
 
-                # C. 3D Non-Rigid Facial Deformation (Huli ang Cellphone/Papel dito!)
-                # Sa cellphone o picture, 100% FLAT ito. Kahit iwagayway mo ang phone, 0.0 ang deformation!
-                feat1 = get_relative_features(lm1[0])
-                feat2 = get_relative_features(lm2[0])
-                internal_deformation = float(np.sum(np.abs(feat1 - feat2)))
+                # B. Pagsuri sa Mata gamit ang Pixel Correlation (HULING-HULI ANG LITRATO DITO!)
+                top1, right1, bottom1, left1 = face_locations1[0]
+                top2, right2, bottom2, left2 = face_locations2[0]
+                h1, w1 = bottom1 - top1, right1 - left1
+                h2, w2 = bottom2 - top2, right2 - left2
 
-                # D. Pagsuri kung inalog ang cellphone (Rigid Translation)
-                nose1 = np.array(lm1[0]['nose_tip'][2])
-                nose2 = np.array(lm2[0]['nose_tip'][2])
-                global_shift = float(np.linalg.norm(nose1 - nose2))
+                eye_box1 = (top1 + 0.18 * h1, left1 + 0.1 * w1, top1 + 0.52 * h1, right1 - 0.1 * w1)
+                eye_box2 = (top2 + 0.18 * h2, left2 + 0.1 * w2, top2 + 0.52 * h2, right2 - 0.1 * w2)
+                eye_crop1 = crop_normalized_region(np1, eye_box1)
+                eye_crop2 = crop_normalized_region(np2, eye_box2)
+                eye_corr = compute_correlation(eye_crop1, eye_crop2)
 
-                # E. Specular Screen Glare (Reflection sa salamin ng cellphone)
-                gray1 = np.mean(np1, axis=2)
-                specular_glare = float(np.sum(gray1 > 248) / gray1.size)
+                # C. Pagsuri sa Buong Mukha (Face Rigidness)
+                face_crop1 = crop_normalized_region(np1, face_locations1[0])
+                face_crop2 = crop_normalized_region(np2, face_locations2[0])
+                face_corr = compute_correlation(face_crop1, face_crop2)
 
-                # ── MGA PATAKARAN SA PAG-HARANG NG PEKE ──
-                # 1. Kung static picture sa cellphone (walang kurap, walang galaw ang bibig, at 0 deformation)
-                if ear_change < 0.009 and mar_change < 0.009 and internal_deformation < 0.012:
+                # D. Specular Glare ng Screen ng Cellphone
+                gray1 = np.mean(np1[top1:bottom1, left1:right1], axis=2)
+                glare_ratio = float(np.sum(gray1 > 248) / (gray1.size + 1e-6))
+
+                # ── RULES: HARANGIN ANG CELLPHONE AT LITRATO ──
+                # 1. Kapag litrato sa cellphone: Walang kurap at 100% identical ang pixels ng mata (> 0.93)
+                if not has_blinked and eye_corr > 0.930 and face_corr > 0.940:
                     return {
                         "matched": False,
-                        "message": "ACCESS DENIED: Cellphone Screen o Litrato ang nakita! Bawal ang litrato."
+                        "message": "ACCESS DENIED: Cellphone Screen o Litrato ang nakita! Bawal ang litrato sa camera."
                     }
 
-                # 2. Kung inalog ang cellphone sa kamay para magkunwaring gumagalaw (flat rigid movement)
-                if global_shift > 1.2 and internal_deformation < 0.011 and ear_change < 0.008:
+                # 2. Kapag walang anumang pagkurap at may reflection ng salamin ng cellphone
+                if not has_blinked and glare_ratio > 0.08 and eye_corr > 0.910:
                     return {
                         "matched": False,
-                        "message": "ACCESS DENIED: Bawal iwagayway ang litrato o cellphone sa camera!"
+                        "message": "ACCESS DENIED: Cellphone Reflection detected. Bawal ang litrato sa cellphone."
                     }
 
-                # 3. Kung may matinding reflection ng screen ng cellphone
-                if specular_glare > 0.14 and internal_deformation < 0.018:
+                # 3. Kapag hindi kumurap ang tao sa camera
+                if not has_blinked and ear_change < 0.012:
                     return {
                         "matched": False,
-                        "message": "ACCESS DENIED: Cellphone reflection detected. Ilapit ang totoong mukha."
+                        "message": "ACCESS DENIED: Walang kurap na nakita. Paki-kurap ang iyong mga mata habang nag-i-scan."
                     }
         else:
             return {"matched": False, "message": "Liveness check requires 2 frames."}
@@ -141,7 +146,7 @@ async def verify_face(
         live_face = live_encodings[0]
         employee_list = json.loads(candidates)
 
-        # ── 3. PRE-WARMED CACHE & EMBEDDINGS MATCHING ──
+        # ── 3. PRE-WARMED CACHE AT PAG-MATCH ──
         for emp in employee_list:
             emp_id = emp["employee_id"]
             if emp_id not in KNOWN_FACE_ENCODINGS:
@@ -167,7 +172,7 @@ async def verify_face(
                     except Exception:
                         pass
 
-        # ── 4. MATCHING ──
+        # ── 4. VERIFY EMPLOYEE IDENTITY ──
         best_match = None
         min_distance = 1.0
         MATCH_THRESHOLD = 0.50
