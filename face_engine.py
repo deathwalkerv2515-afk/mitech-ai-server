@@ -1,3 +1,8 @@
+# =============================================================================
+# MiTech Biometric AI Face Recognition & Anti-Spoofing Engine
+# File: face.py (Production Ready - Full Fix Edition)
+# =============================================================================
+
 import io
 import json
 import requests
@@ -7,8 +12,9 @@ import face_recognition
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="MiTech Anti-Spoofing & Liveness AI Engine")
+app = FastAPI(title="MiTech Biometric AI Engine")
 
+# CORS setup para sa Kiosk at Web connections
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,41 +23,48 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Dynamic in-memory cache
-KNOWN_FACE_ENCODINGS = {}
-KNOWN_EMPLOYEES_META = {}
-CACHED_PHOTO_HASHES = {}
+# ── PERMANENT URL-LEVEL CACHE ────────────────────────────────────────────────
+# URL -> list of face encodings (np.ndarray)
+# Hindi na buburahin ang cache kada scan upang maging 0 milliseconds ang matching
+# at maiwasan ang network timeout sa pag-download mula sa Supabase.
+PHOTO_URL_CACHE: dict[str, list[np.ndarray]] = {}
 
-def get_ear(eye):
-    """Kalkulahin ang Eye Aspect Ratio (EAR)."""
-    A = np.linalg.norm(np.array(eye[1]) - np.array(eye[5]))
-    B = np.linalg.norm(np.array(eye[2]) - np.array(eye[4]))
-    C = np.linalg.norm(np.array(eye[0]) - np.array(eye[3]))
-    return float((A + B) / (2.0 * C))
+
+def get_ear(eye) -> float:
+    """Kalkulahin ang Eye Aspect Ratio (EAR) para sa facial geometry."""
+    a = np.linalg.norm(np.array(eye[1]) - np.array(eye[5]))
+    b = np.linalg.norm(np.array(eye[2]) - np.array(eye[4]))
+    c = np.linalg.norm(np.array(eye[0]) - np.array(eye[3]))
+    return float((a + b) / (2.0 * c))
+
 
 @app.get("/")
 def root():
     return {
         "status": "MiTech AI Engine Live",
-        "cached_employees": len(KNOWN_FACE_ENCODINGS)
+        "cached_photos": len(PHOTO_URL_CACHE),
+        "engine_version": "2026.11-optimized"
     }
+
 
 @app.post("/clear-cache")
 def clear_cache():
-    """Tawagin ito kapag may binura o binagong empleyado para mag-refresh agad."""
-    KNOWN_FACE_ENCODINGS.clear()
-    KNOWN_EMPLOYEES_META.clear()
-    CACHED_PHOTO_HASHES.clear()
-    return {"status": "Cache Cleared Successfully"}
+    """Tawagin kapag may binago, in-update, o binurang larawan ng empleyado."""
+    PHOTO_URL_CACHE.clear()
+    return {
+        "status": "success",
+        "message": "Permanent photo cache cleared successfully."
+    }
+
 
 @app.post("/verify-face")
 async def verify_face(
-    image1: UploadFile = File(...),         # Frame 1
-    image2: UploadFile = File(None),        # Frame 2
-    candidates: str = Form(...)             # JSON list ng empleyado para sa branch na ito
+    image1: UploadFile = File(...),         # Live Webcam Frame 1
+    image2: UploadFile = File(None),        # Live Webcam Frame 2 (Para sa Anti-Spoofing)
+    candidates: str = Form(...)             # JSON list ng mga empleyado para sa branch na ito
 ):
     try:
-        # 1. I-parse ang mga kandidatong empleyado para sa kasalukuyang branch
+        # 1. I-parse ang candidate list na ipinasa ng Kiosk Terminal
         try:
             employee_list = json.loads(candidates)
         except Exception:
@@ -63,102 +76,112 @@ async def verify_face(
                 "message": "ACCESS DENIED: Walang rehistradong empleyado sa branch na ito."
             }
 
-        # Kuhanin ang listahan ng legal employee IDs sa active branch
-        current_branch_emp_ids = {emp["employee_id"] for emp in employee_list}
-
-        # Tanggalin sa cache ang mga mukha na hindi na kabilang sa branch o na-delete na
-        cached_keys = list(KNOWN_FACE_ENCODINGS.keys())
-        for c_id in cached_keys:
-            if c_id not in current_branch_emp_ids:
-                KNOWN_FACE_ENCODINGS.pop(c_id, None)
-                KNOWN_EMPLOYEES_META.pop(c_id, None)
-                CACHED_PHOTO_HASHES.pop(c_id, None)
-
-        # 2. I-load ang Live Frame 1 na may malinaw na resolution (800x800)
+        # 2. Basahin at i-proseso ang Live Frame 1
         c1 = await image1.read()
         pil1 = Image.open(io.BytesIO(c1)).convert("RGB")
         pil1.thumbnail((800, 800))
         np1 = np.array(pil1)
 
-        face_locations1 = face_recognition.face_locations(np1, model="hog")
+        # HOG face detector na may 1x upsample para mabilis at accurate kahit medyo malayo sa camera
+        face_locations1 = face_recognition.face_locations(np1, number_of_times_to_upsample=1, model="hog")
         if not face_locations1:
-            return {"matched": False, "message": "Walang mukhang nakita. Tumingin nang diretso sa bilog."}
+            # Fallback kapag malapit na malapit ang mukha
+            face_locations1 = face_recognition.face_locations(np1, number_of_times_to_upsample=0, model="hog")
+            if not face_locations1:
+                return {
+                    "matched": False,
+                    "message": "Walang mukhang nakita. Tumingin nang diretso sa bilog."
+                }
 
         live_encodings = face_recognition.face_encodings(np1, face_locations1)
         if not live_encodings:
-            return {"matched": False, "message": "Hindi ma-proseso ang mukha. Siguraduhing maliwanag ang paligid."}
+            return {
+                "matched": False,
+                "message": "Hindi ma-proseso ang mukha. Siguraduhing maliwanag ang paligid."
+            }
 
-        # 3. Mabilis at maaasahang Liveness Check
+        live_face = live_encodings[0]
+
+        # 3. Liveness & Anti-Still-Photo Spoofing Check
+        # Hindi bina-block ang tao kung hindi saktong kumurap sa 320ms;
+        # sa halip, sinisigurong hindi 100% static printout o litrato sa cellphone ang nakatapat.
         if image2 is not None:
             c2 = await image2.read()
             pil2 = Image.open(io.BytesIO(c2)).convert("RGB")
             pil2.thumbnail((800, 800))
             np2 = np.array(pil2)
 
-            face_locations2 = face_recognition.face_locations(np2, model="hog")
+            face_locations2 = face_recognition.face_locations(np2, number_of_times_to_upsample=0, model="hog")
             if face_locations2:
-                lm1 = face_recognition.face_landmarks(np1, face_locations1)
-                lm2 = face_recognition.face_landmarks(np2, face_locations2)
+                # Suriin ang pagkakaiba ng Frame 1 at Frame 2
+                pixel_diff = float(np.mean(np.abs(np1.astype(float) - np2.astype(float))))
+                
+                # Kapag eksaktong magkapareho ang pixel arrays (diff < 0.45), litrato lamang ito sa cellphone o printout
+                if pixel_diff < 0.45:
+                    return {
+                        "matched": False,
+                        "message": "ACCESS DENIED: Peke o litrato sa cellphone ang nakatapat."
+                    }
 
-                if lm1 and lm2:
-                    ear1 = (get_ear(lm1[0]['left_eye']) + get_ear(lm1[0]['right_eye'])) / 2.0
-                    ear2 = (get_ear(lm2[0]['left_eye']) + get_ear(lm2[0]['right_eye'])) / 2.0
-                    ear_change = abs(ear1 - ear2)
-                    has_blinked = (ear_change >= 0.015) or (ear1 < 0.19 or ear2 < 0.19)
+        # 4. Kunin ang mga Facial Encodings ng Candidates gamit ang Permanent URL Cache
+        candidate_encodings = {}  # emp_id -> list of np.ndarray encodings
+        candidate_meta = {}       # emp_id -> emp dict
 
-                    # Harangan kapag 100% static na printout o picture
-                    if not has_blinked and ear_change < 0.005:
-                        return {
-                            "matched": False,
-                            "message": "ACCESS DENIED: Paki-kurap ang iyong mga mata habang nag-i-scan."
-                        }
-
-        live_face = live_encodings[0]
-
-        # 4. I-encode lamang ang mga empleyado ng active branch
         for emp in employee_list:
-            emp_id = emp["employee_id"]
+            emp_id = emp.get("employee_id")
+            if not emp_id:
+                continue
+
+            candidate_meta[emp_id] = emp
+            candidate_encodings[emp_id] = []
+
+            # Kunin ang 5-angle face photos kung mayroon, o ang single photo_url
             photos = emp.get("face_photos") or []
             if not photos and emp.get("photo_url"):
                 photos = [{"angle": "front", "url": emp.get("photo_url")}]
 
             photo_urls = [p.get("url") if isinstance(p, dict) else p for p in photos if p]
-            current_hash = ",".join(filter(None, photo_urls))
 
-            # Kapag bago o binago ang picture, i-download at i-encode
-            if emp_id not in KNOWN_FACE_ENCODINGS or CACHED_PHOTO_HASHES.get(emp_id) != current_hash:
-                KNOWN_FACE_ENCODINGS[emp_id] = []
-                KNOWN_EMPLOYEES_META[emp_id] = emp
-                CACHED_PHOTO_HASHES[emp_id] = current_hash
+            for url in photo_urls:
+                if not url or not isinstance(url, str) or not url.startswith("http"):
+                    continue
 
-                for url in photo_urls:
-                    if not url:
-                        continue
+                # KUNG NASA CACHE NA: Instant 0ms retrieval! Walang download delay!
+                if url in PHOTO_URL_CACHE:
+                    candidate_encodings[emp_id].extend(PHOTO_URL_CACHE[url])
+                else:
+                    # KUNG BAGO: I-download minsan lang at i-cache nang permanente
                     try:
-                        res = requests.get(url, timeout=3.0)
+                        res = requests.get(url, timeout=5.0)
                         if res.status_code == 200:
                             ref_pil = Image.open(io.BytesIO(res.content)).convert("RGB")
                             ref_pil.thumbnail((640, 640))
                             encs = face_recognition.face_encodings(np.array(ref_pil))
-                            if encs:
-                                KNOWN_FACE_ENCODINGS[emp_id].append(encs[0])
+                            PHOTO_URL_CACHE[url] = encs
+                            candidate_encodings[emp_id].extend(encs)
                     except Exception as err:
-                        print(f"Error fetching photo for {emp_id}: {err}")
+                        print(f"Warning: Failed to fetch image {url} for {emp_id}: {err}")
 
-        # 5. Isolate matching: Sa active branch candidates LAMANG maghahanap
+        # 5. Accurate Euclidean Distance Matching
+        # MATCH_THRESHOLD = 0.585:
+        # - Masyadong maselan ang 0.56 (nagdudulot ng false rejection kapag may anino ang webcam).
+        # - Ang 0.585 ay napakatatag para sa mga webcam at front cameras habang hinaharang pa rin ang ibang tao.
         best_match = None
         min_distance = 1.0
-        MATCH_THRESHOLD = 0.56  # Sakto para sa normal na webcam na may anino
+        MATCH_THRESHOLD = 0.585
 
-        for emp_id in current_branch_emp_ids:
-            enc_list = KNOWN_FACE_ENCODINGS.get(emp_id, [])
+        for emp_id, enc_list in candidate_encodings.items():
             if not enc_list:
                 continue
 
-            dist = float(np.min(face_recognition.face_distance(enc_list, live_face)))
+            distances = face_recognition.face_distance(enc_list, live_face)
+            if len(distances) == 0:
+                continue
+
+            dist = float(np.min(distances))
             if dist < min_distance:
                 min_distance = dist
-                best_match = KNOWN_EMPLOYEES_META.get(emp_id)
+                best_match = candidate_meta[emp_id]
 
         if best_match and min_distance <= MATCH_THRESHOLD:
             confidence = round((1.0 - min_distance) * 100, 1)
@@ -169,6 +192,7 @@ async def verify_face(
                 "department": best_match.get("department", "Staff"),
                 "position": best_match.get("position", "Member"),
                 "salary_type": best_match.get("salary_type", "Fixed Monthly"),
+                "branch_code": best_match.get("branch_code", "MAIN"),
                 "confidence": f"{confidence}%",
                 "distance": float(min_distance)
             }
@@ -180,6 +204,7 @@ async def verify_face(
 
     except Exception as e:
         return {"matched": False, "error": str(e)}
+
 
 if __name__ == "__main__":
     import uvicorn
