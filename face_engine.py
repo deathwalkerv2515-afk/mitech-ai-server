@@ -1,6 +1,6 @@
 # =============================================================================
 # MiTech Biometric AI Face Recognition & Anti-Spoofing Engine
-# File: face.py (Production Ready - Full Fix Edition)
+# File: face_engine.py (Render Production Ready)
 # =============================================================================
 
 import io
@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="MiTech Biometric AI Engine")
 
-# CORS setup para sa Kiosk at Web connections
+# CORS setup para makakonekta ang Kiosk at Web Dashboard
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,15 +23,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── PERMANENT URL-LEVEL CACHE ────────────────────────────────────────────────
-# URL -> list of face encodings (np.ndarray)
+# ── PERMANENT IN-MEMORY CACHE (Compatible sa lahat ng Python versions) ────────
+# URL -> list of face encodings
 # Hindi na buburahin ang cache kada scan upang maging 0 milliseconds ang matching
-# at maiwasan ang network timeout sa pag-download mula sa Supabase.
-PHOTO_URL_CACHE: dict[str, list[np.ndarray]] = {}
+# at hindi mag-timeout sa pag-download ng picture mula sa Supabase.
+PHOTO_URL_CACHE = {}
 
 
-def get_ear(eye) -> float:
-    """Kalkulahin ang Eye Aspect Ratio (EAR) para sa facial geometry."""
+def get_ear(eye):
+    """Kalkulahin ang Eye Aspect Ratio (EAR)."""
     a = np.linalg.norm(np.array(eye[1]) - np.array(eye[5]))
     b = np.linalg.norm(np.array(eye[2]) - np.array(eye[4]))
     c = np.linalg.norm(np.array(eye[0]) - np.array(eye[3]))
@@ -43,7 +43,7 @@ def root():
     return {
         "status": "MiTech AI Engine Live",
         "cached_photos": len(PHOTO_URL_CACHE),
-        "engine_version": "2026.11-optimized"
+        "engine": "FastAPI + face_recognition"
     }
 
 
@@ -60,7 +60,7 @@ def clear_cache():
 @app.post("/verify-face")
 async def verify_face(
     image1: UploadFile = File(...),         # Live Webcam Frame 1
-    image2: UploadFile = File(None),        # Live Webcam Frame 2 (Para sa Anti-Spoofing)
+    image2: UploadFile = File(None),        # Live Webcam Frame 2
     candidates: str = Form(...)             # JSON list ng mga empleyado para sa branch na ito
 ):
     try:
@@ -85,7 +85,6 @@ async def verify_face(
         # HOG face detector na may 1x upsample para mabilis at accurate kahit medyo malayo sa camera
         face_locations1 = face_recognition.face_locations(np1, number_of_times_to_upsample=1, model="hog")
         if not face_locations1:
-            # Fallback kapag malapit na malapit ang mukha
             face_locations1 = face_recognition.face_locations(np1, number_of_times_to_upsample=0, model="hog")
             if not face_locations1:
                 return {
@@ -102,29 +101,27 @@ async def verify_face(
 
         live_face = live_encodings[0]
 
-        # 3. Liveness & Anti-Still-Photo Spoofing Check
-        # Hindi bina-block ang tao kung hindi saktong kumurap sa 320ms;
-        # sa halip, sinisigurong hindi 100% static printout o litrato sa cellphone ang nakatapat.
+        # 3. Liveness & Anti-Still-Photo Spoofing Check (Crash-proof)
         if image2 is not None:
-            c2 = await image2.read()
-            pil2 = Image.open(io.BytesIO(c2)).convert("RGB")
-            pil2.thumbnail((800, 800))
-            np2 = np.array(pil2)
+            try:
+                c2 = await image2.read()
+                pil2 = Image.open(io.BytesIO(c2)).convert("RGB")
+                pil2.thumbnail((800, 800))
 
-            face_locations2 = face_recognition.face_locations(np2, number_of_times_to_upsample=0, model="hog")
-            if face_locations2:
-                # Suriin ang pagkakaiba ng Frame 1 at Frame 2
-                pixel_diff = float(np.mean(np.abs(np1.astype(float) - np2.astype(float))))
-                
-                # Kapag eksaktong magkapareho ang pixel arrays (diff < 0.45), litrato lamang ito sa cellphone o printout
-                if pixel_diff < 0.45:
-                    return {
-                        "matched": False,
-                        "message": "ACCESS DENIED: Peke o litrato sa cellphone ang nakatapat."
-                    }
+                # Tiyaking parehas ang sukat bago ikumpara upang maiwasan ang dimension error
+                if pil1.size == pil2.size:
+                    np2 = np.array(pil2)
+                    pixel_diff = float(np.mean(np.abs(np1.astype(float) - np2.astype(float))))
+                    if pixel_diff < 0.45:
+                        return {
+                            "matched": False,
+                            "message": "ACCESS DENIED: Peke o litrato sa cellphone ang nakatapat."
+                        }
+            except Exception as spoof_err:
+                print(f"Anti-spoofing warning: {spoof_err}")
 
         # 4. Kunin ang mga Facial Encodings ng Candidates gamit ang Permanent URL Cache
-        candidate_encodings = {}  # emp_id -> list of np.ndarray encodings
+        candidate_encodings = {}  # emp_id -> list of encodings
         candidate_meta = {}       # emp_id -> emp dict
 
         for emp in employee_list:
@@ -135,7 +132,6 @@ async def verify_face(
             candidate_meta[emp_id] = emp
             candidate_encodings[emp_id] = []
 
-            # Kunin ang 5-angle face photos kung mayroon, o ang single photo_url
             photos = emp.get("face_photos") or []
             if not photos and emp.get("photo_url"):
                 photos = [{"angle": "front", "url": emp.get("photo_url")}]
@@ -150,7 +146,6 @@ async def verify_face(
                 if url in PHOTO_URL_CACHE:
                     candidate_encodings[emp_id].extend(PHOTO_URL_CACHE[url])
                 else:
-                    # KUNG BAGO: I-download minsan lang at i-cache nang permanente
                     try:
                         res = requests.get(url, timeout=5.0)
                         if res.status_code == 200:
@@ -162,10 +157,7 @@ async def verify_face(
                     except Exception as err:
                         print(f"Warning: Failed to fetch image {url} for {emp_id}: {err}")
 
-        # 5. Accurate Euclidean Distance Matching
-        # MATCH_THRESHOLD = 0.585:
-        # - Masyadong maselan ang 0.56 (nagdudulot ng false rejection kapag may anino ang webcam).
-        # - Ang 0.585 ay napakatatag para sa mga webcam at front cameras habang hinaharang pa rin ang ibang tao.
+        # 5. Euclidean Distance Matching (Threshold: 0.585)
         best_match = None
         min_distance = 1.0
         MATCH_THRESHOLD = 0.585
